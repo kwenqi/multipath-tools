@@ -44,6 +44,7 @@
 struct client {
 	struct list_head node;
 	int fd;
+	bool is_root;
 };
 
 /* The number of fds we poll on, other than individual client connections */
@@ -57,6 +58,12 @@ struct client {
  * processes connecting.
  */
 #define MAX_CLIENTS (16384 - POLLFDS_BASE)
+
+/*
+ * Limit the number of non-root clients to guarantee that there is always
+ * space for root clients
+ */
+#define MAX_NON_ROOT_CLIENTS 256
 
 /* Compile-time error if POLLFD_CHUNK is too small */
 static __attribute__((unused)) char ___a[-(MIN_POLLS <= 0)];
@@ -107,7 +114,7 @@ static void dead_client(struct client *c)
 /*
  * handle a new client joining
  */
-static void new_client(int ux_sock)
+static void new_client(int ux_sock, int non_root_clients)
 {
 	struct client *c;
 	struct sockaddr addr;
@@ -127,6 +134,11 @@ static void new_client(int ux_sock)
 	memset(c, 0, sizeof(*c));
 	INIT_LIST_HEAD(&c->node);
 	c->fd = fd;
+	c->is_root = _socket_client_is_root(c->fd);
+	if (!c->is_root && non_root_clients >= MAX_NON_ROOT_CLIENTS) {
+		dead_client(c);
+		return;
+	}
 
 	/* put it in our linked list */
 	pthread_mutex_lock(&client_lock);
@@ -314,14 +326,16 @@ void * uxsock_listen(uxsock_trigger_fn uxsock_trigger, long ux_sock,
 	sigdelset(&mask, SIGUSR1);
 	while (1) {
 		struct client *c, *tmp;
-		int i, n_pfds, poll_count, num_clients;
+		int i, n_pfds, poll_count, num_clients, non_root_clients;
 
 		/* setup for a poll */
 		pthread_mutex_lock(&client_lock);
 		pthread_cleanup_push(cleanup_mutex, &client_lock);
-		num_clients = 0;
+		num_clients = non_root_clients = 0;
 		list_for_each_entry(c, &clients, node) {
 			num_clients++;
+			if (!c->is_root)
+				non_root_clients++;
 		}
 		if (num_clients + POLLFDS_BASE > max_pfds) {
 			struct pollfd *new;
@@ -426,6 +440,8 @@ void * uxsock_listen(uxsock_trigger_fn uxsock_trigger, long ux_sock,
 				if (recv_packet_from_client(c->fd, &inbuf,
 							    uxsock_timeout)
 				    != 0) {
+					if (!c->is_root)
+						non_root_clients--;
 					dead_client(c);
 					continue;
 				}
@@ -437,11 +453,12 @@ void * uxsock_listen(uxsock_trigger_fn uxsock_trigger, long ux_sock,
 				condlog(4, "cli[%d]: Got request [%s]",
 					i, inbuf);
 				uxsock_trigger(inbuf, &reply, &rlen,
-					       _socket_client_is_root(c->fd),
-					       trigger_data);
+					       c->is_root, trigger_data);
 				if (reply) {
 					if (send_packet(c->fd,
 							reply) != 0) {
+						if (!c->is_root)
+							non_root_clients--;
 						dead_client(c);
 					} else {
 						condlog(4, "cli[%d]: "
@@ -461,7 +478,7 @@ void * uxsock_listen(uxsock_trigger_fn uxsock_trigger, long ux_sock,
 
 		/* see if we got a new client */
 		if (polls[0].revents & POLLIN) {
-			new_client(ux_sock);
+			new_client(ux_sock, non_root_clients);
 		}
 
 		/* handle inotify events on config files */
