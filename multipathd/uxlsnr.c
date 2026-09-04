@@ -420,6 +420,7 @@ void * uxsock_listen(uxsock_trigger_fn uxsock_trigger, long ux_sock,
 		/* see if a client wants to speak to us */
 		for (i = POLLFDS_BASE; i < n_pfds; i++) {
 			if (polls[i].revents & POLLIN) {
+				int unread;
 				struct timespec start_time;
 
 				c = NULL;
@@ -434,6 +435,14 @@ void * uxsock_listen(uxsock_trigger_fn uxsock_trigger, long ux_sock,
 				if (!c) {
 					condlog(4, "cli%d: new fd %d",
 						i, polls[i].fd);
+					continue;
+				}
+				if (!c->is_root &&
+				    ioctl(c->fd, TIOCOUTQ, &unread) == 0  &&
+				    unread != 0) {
+					condlog(2, "Closing cli[%d] due to "
+						"%d unread bytes", i, unread);
+					dead_client(c);
 					continue;
 				}
 				get_monotonic_time(&start_time);
